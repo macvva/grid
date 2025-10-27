@@ -630,3 +630,196 @@ for (tenor, alpha, t_s, T, sdate, edate) in instruments:
 
 print("\nKnots (years):", [f"{t:.8f}" for t in knot_times])
 print("Residual L2-norm:", float(np.linalg.norm(r_fin)))
+
+
+
+
+
+
+
+#dupa#
+
+# -*- coding: utf-8 -*-
+"""
+USD OIS (SOFR) — ON / 1W / 1M
+Globalny fit krzywej dyskontowej metodą Newtona–Raphsona z log-linear na DF.
+Konwencje:
+  - Day Count: ACT/360 (kupon)
+  - Kalendarz: UnitedStates(FederalReserve)
+  - Spot lag: 1d (T+1)
+  - BDC: Following (≤1M), Modified Following (>1M)
+  - ON: start = dziś; 1W/1M: start = SPOT (T+1)
+Równanie OIS (forward-start):
+  (S*alpha + 1) * P(T) - P(start) = 0
+"""
+
+import math
+import numpy as np
+import QuantLib as ql
+
+# =========================
+# 0) Parametry rynkowe
+# =========================
+valuation_date = ql.Date(27, 10, 2025)                 # dzisiaj
+ql.Settings.instance().evaluationDate = valuation_date
+
+cal = ql.UnitedStates(ql.UnitedStates.FederalReserve)  # kalendarz SOFR/US Gov
+dc_leg  = ql.Actual360()                               # do α kuponu
+dc_axis = ql.Actual365Fixed()                          # oś czasu (dowolna spójna); α zawsze ACT/360
+spot_lag = 1                                           # USD OIS: T+1
+
+# <<< PODMIEŃ NA SWOJE STAWKI (w UŁAMKU, np. 0.0520 = 5.20%) >>>
+quotes = {
+    "ON": 0.05250,
+    "1W": 0.05200,
+    "1M": 0.05150,
+}
+
+# =========================
+# 1) Daty i α = ACT/360
+# =========================
+def bdc_for(tenor: str):
+    t = tenor.upper()
+    return ql.Following if t in ("ON", "TN", "1W", "2W", "1M") else ql.ModifiedFollowing
+
+def usd_ois_period(tenor: str):
+    """
+    Zwraca: (tenor, alpha, t_start, t_end, start_date, end_date)
+      - ON: start=dziś (Following), end=+1d (Following)
+      - 1W/1M: start=SPOT (T+1, Following), end=adjust(spot+tenor, BDC)
+    alpha = ACT/360; t_* = lata od valuation_date (dc_axis)
+    """
+    t = tenor.upper().strip()
+    bdc = bdc_for(t)
+
+    if t == "ON":
+        start = cal.adjust(valuation_date, ql.Following)
+        end   = cal.advance(start, 1, ql.Days, ql.Following)
+    else:
+        spot  = cal.advance(valuation_date, spot_lag, ql.Days, ql.Following)
+        start = spot
+        end   = cal.adjust(spot + ql.Period(t), bdc)
+
+    alpha   = float(dc_leg.yearFraction(start, end))
+    t_start = float(dc_axis.yearFraction(valuation_date, start))
+    t_end   = float(dc_axis.yearFraction(valuation_date, end))
+    return (t, alpha, t_start, t_end, start, end)
+
+tenors = ["ON", "1W", "1M"]
+instruments = [usd_ois_period(t) for t in tenors]
+
+# =========================
+# 2) Węzły i interpolacja
+# =========================
+# Węzły: 0.0 + wszystkie starty i końce (trafiamy dokładnie P(start) i P(T))
+knot_times = {0.0}
+for (_, _, t_s, t_e, _, _) in instruments:
+    knot_times.add(t_s); knot_times.add(t_e)
+knot_times = sorted(knot_times)
+
+def weights_loglinear(t: float, knots: list[float], eps: float = 1e-14) -> np.ndarray:
+    """
+    Wagi do ln P(t) (log-linear). Snap do węzłów: jeżeli t≈węzeł → 100% tego węzła.
+    """
+    K = len(knots)
+    w = np.zeros(K)
+    # snap do węzła
+    for i, tau in enumerate(knots):
+        if abs(t - tau) <= eps:
+            w[i] = 1.0
+            return w
+    if t < knots[0]:
+        w[0] = 1.0; return w
+    if t > knots[-1]:
+        w[-1] = 1.0; return w
+    # wewnątrz: segment [k, k+1]
+    k = max(i for i in range(K-1) if knots[i] <= t)
+    tau0, tau1 = knots[k], knots[k+1]
+    lam = (t - tau0) / (tau1 - tau0)
+    w[k]   = 1.0 - lam
+    w[k+1] = lam
+    return w
+
+def P_from_x(t: float, knots: list[float], x_all: np.ndarray) -> float:
+    """P(t) = exp( w(t) · x ), gdzie x = ln P w węzłach; x[0]=0 → P(0)=1."""
+    return math.exp(float(np.dot(weights_loglinear(t, knots), x_all)))
+
+# =========================
+# 3) Residua i Jakobian
+# =========================
+# OIS (ON/1W/1M jednokuponowe):
+#   r_k = (S_k*alpha_k + 1) * P(T_k) - P(start_k) = 0
+def residuals_and_jacobian(x_var: np.ndarray):
+    # x0=0 → P(0)=1 (nieoptymalizowany); zmienne to x[1..]
+    x_all = np.zeros(len(knot_times))
+    x_all[1:] = x_var
+
+    r = np.zeros(len(instruments))
+    J = np.zeros((len(instruments), len(x_var)))
+
+    for k, (tenor, alpha, t_s, T, _, _) in enumerate(instruments):
+        S = quotes[tenor]
+        P_T = P_from_x(T,       knot_times, x_all)
+        P_s = P_from_x(t_s,     knot_times, x_all)   # ON: t_s=0 → P_s=1
+
+        # residuum
+        r[k] = (S * alpha + 1.0) * P_T - P_s
+
+        # Jakobian: (S*α + 1) * P(T) * w(T)  -  P(s) * w(s)
+        w_T = weights_loglinear(T,   knot_times)[1:]  # bez x0
+        w_s = weights_loglinear(t_s, knot_times)[1:]
+        J[k, :] = (S * alpha + 1.0) * P_T * w_T - P_s * w_s
+
+    return r, J
+
+# =========================
+# 4) Newton-Raphson
+# =========================
+def newton_solve(x0: np.ndarray, max_iter: int = 50, tol: float = 1e-14):
+    x = x0.copy()
+    r, J = residuals_and_jacobian(x)
+    norm0 = np.linalg.norm(r)
+    for _ in range(max_iter):
+        dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
+        x += dx
+        r, J = residuals_and_jacobian(x)
+        if np.linalg.norm(r) < tol * max(1.0, norm0):
+            break
+    return x, r
+
+# =========================
+# 5) Inicjalizacja i solve
+# =========================
+avg_rate = float(np.mean(list(quotes.values())))
+x0_var = np.array([-avg_rate * t for t in knot_times[1:]], dtype=float)  # ln P ≈ -r*t
+
+x_opt, r_fin = newton_solve(x0_var)
+x_all = np.zeros(len(knot_times))
+x_all[1:] = x_opt
+
+# =========================
+# 6) Wyniki i kontrola
+# =========================
+discount_factors = {t: P_from_x(t, knot_times, x_all) for t in knot_times}
+
+print("== Instrumenty (daty i α) ==")
+for (tenor, alpha, t_s, t_e, sdate, edate) in instruments:
+    print(f"{tenor:>3s}  start={sdate}  end={edate}  alpha={alpha:.10f}")
+
+print("\n== DF na węzłach ==")
+for t in knot_times:
+    P = discount_factors[t]
+    zr_cont = 0.0 if t == 0.0 else -math.log(P) / t  # zero (continuous comp) na osi dc_axis
+    print(f"t={t:>9.6f}  P(t)={P:.12f}  zero_cont={zr_cont:.12f}")
+
+print("\n== Market vs Model (par rates) ==")
+for (tenor, alpha, t_s, T, sdate, edate) in instruments:
+    P_T = discount_factors[T]
+    P_s = discount_factors[t_s]
+    S_model = (P_s - P_T) / (alpha * P_T)
+    err_bp = (S_model - quotes[tenor]) * 1e4
+    print(f"{tenor:>3s}  S_mkt={quotes[tenor]:.8f}  S_mod={S_model:.8f}  err_bp={err_bp:+.3f}  "
+          f"[start={sdate} → end={edate}, α={alpha:.8f}]")
+
+print("\nKnots (years):", [f"{t:.8f}" for t in knot_times])
+print("Residual L2-norm:", float(np.linalg.norm(r_fin)))
