@@ -1033,3 +1033,239 @@ for ins in info:
     alpha_tot = sum(a for _, a in coupons)
     print(f"{tenor:>3s}  start={start}  end={end}  alpha_sum={alpha_tot:.8f}  "
           f"S_mkt={S:.8f}  S_mod={S_model:.8f}  err_bp={err_bp:+.3f}")
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+USD OIS (SOFR) — Bootstrap krzywej dyskontowej z kotwicą ON/TN
+Konwencje:
+  - Data wyceny: 27/10/2025
+  - Spot lag: 2 dni (T+2)
+  - Kalendarz: UnitedStates(FederalReserve)
+  - BDC: ≤1M -> Following, >1M -> Modified Following
+  - Day Count kuponu: ACT/360
+  - Interpolacja: log-linear na DF po osi czasu ACT/365F
+  - Kotwica: P(T+1) z ON, P(T+2) (spot) z TN — jeśli brak TN, przyjmujemy TN = ON
+"""
+
+import math
+from typing import List, Tuple, Dict
+import QuantLib as ql
+
+# ========= 1) PARAMETRY RYNKOWE =========
+VAL_DATE = ql.Date(27, 10, 2025)
+ql.Settings.instance().evaluationDate = VAL_DATE
+
+CAL = ql.UnitedStates(ql.UnitedStates.FederalReserve)
+DC_LEG = ql.Actual360()          # α kuponów OIS (dla nogi stałej)
+DC_AXIS = ql.Actual365Fixed()    # oś czasu do interpolacji (dowolna spójna)
+SPOT_LAG = 2                     # T+2
+
+def bdc_for(tenor: str):
+    t = tenor.upper()
+    return ql.Following if t in ("ON", "TN", "1W", "2W", "1M") else ql.ModifiedFollowing
+
+# ===== PODMIEŃ NA SWOJE STAWKI (ułamek, nie %) =====
+# Możesz dodać TN; jeśli nie dodasz, kod użyje TN=ON.
+QUOTES: List[Tuple[str, float]] = [
+    ("ON", 0.05250),
+    # ("TN", 0.05245),    # możesz odkomentować, jeśli masz TN z rynku
+    ("1W", 0.05200),
+    ("1M", 0.05150),
+    ("3M", 0.05080),
+    ("6M", 0.05020),
+    ("1Y", 0.04950),
+    ("2Y", 0.04750),
+    ("3Y", 0.04600),
+]
+
+# ========= 2) POMOCNICZE: SPOT, HARMONOGRAM, ALFY =========
+def tenor_period(tenor: str) -> ql.Period:
+    t = tenor.upper().strip()
+    if t == "ON":         return ql.Period(1, ql.Days)
+    if t == "TN":         return ql.Period(1, ql.Days)  # TN to też 1 dzień, ale od T+1 do T+2
+    if t.endswith("W"):   return ql.Period(int(t[:-1]), ql.Weeks)
+    if t.endswith("M"):   return ql.Period(int(t[:-1]), ql.Months)
+    if t.endswith("Y"):   return ql.Period(int(t[:-1]), ql.Years)
+    raise ValueError(f"Nieznany tenor: {tenor}")
+
+def spot_date() -> ql.Date:
+    return CAL.advance(VAL_DATE, SPOT_LAG, ql.Days, ql.Following)
+
+def build_ois_schedule(tenor: str):
+    """
+    Zwraca:
+      start_date, end_date, coupons: List[(pay_date, alpha)]
+    Reguły:
+      - ON: start=dziś (Following), end=+1d (Following), 1 kupon
+      - TN: start=T+1, end=T+2 (oba Following), 1 kupon
+      - ≤1Y: start=SPOT, end=SPOT+tenor (BDC wg zasad), 1 kupon
+      - >1Y: start=SPOT, end=SPOT+tenor (BDC=ModFoll), roczne kupony
+    """
+    t = tenor.upper().strip()
+
+    if t == "ON":
+        start = CAL.adjust(VAL_DATE, ql.Following)
+        end   = CAL.advance(start, 1, ql.Days, ql.Following)
+        alpha = DC_LEG.yearFraction(start, end)
+        return start, end, [(end, alpha)]
+
+    if t == "TN":
+        d0 = CAL.adjust(VAL_DATE, ql.Following)          # dziś (adjusted)
+        start = CAL.advance(d0, 1, ql.Days, ql.Following)  # jutro (T+1)
+        end   = CAL.advance(start, 1, ql.Days, ql.Following)  # pojutrze (T+2)
+        alpha = DC_LEG.yearFraction(start, end)
+        return start, end, [(end, alpha)]
+
+    # forward-start od SPOT
+    s = spot_date()
+    per = tenor_period(t)
+    bdc = bdc_for(t)
+    end = CAL.advance(s, per, bdc)
+
+    # ≤1Y → 1 kupon
+    if (per.units() in (ql.Weeks, ql.Months)) or (per.units() == ql.Years and per.length() <= 1):
+        alpha = DC_LEG.yearFraction(s, end)
+        return s, end, [(end, alpha)]
+
+    # >1Y → roczne kupony stałej nogi
+    sched = ql.Schedule(
+        s, end, ql.Period(ql.Annual),
+        CAL, ql.ModifiedFollowing, ql.ModifiedFollowing,
+        ql.DateGeneration.Forward, False
+    )
+    coupons = []
+    for i in range(1, len(sched)):
+        d_prev, d_pay = sched[i-1], sched[i]
+        alpha = DC_LEG.yearFraction(d_prev, d_pay)
+        coupons.append((d_pay, alpha))
+    return s, end, coupons
+
+# ========= 3) INTERPOLACJA LOG-LINEAR NA DF =========
+def t_years(d: ql.Date) -> float:
+    return DC_AXIS.yearFraction(VAL_DATE, d)
+
+def loglinear_df_interpolate(query_date: ql.Date, known_dfs: Dict[ql.Date, float]) -> float:
+    """Interpolacja log-linear DF między najbliższymi znanymi datami (po ACT/365F)."""
+    if query_date in known_dfs:
+        return known_dfs[query_date]
+    dates = sorted(known_dfs.keys(), key=lambda x: int(x.serialNumber()))
+    if query_date <= dates[0]:
+        return known_dfs[dates[0]]
+    if query_date >= dates[-1]:
+        return known_dfs[dates[-1]]
+    for i in range(1, len(dates)):
+        d0, d1 = dates[i-1], dates[i]
+        if d0 <= query_date <= d1:
+            t0, t1, tq = t_years(d0), t_years(d1), t_years(query_date)
+            lam = (tq - t0) / (t1 - t0)
+            lnP = (1.0 - lam) * math.log(known_dfs[d0]) + lam * math.log(known_dfs[d1])
+            return math.exp(lnP)
+    raise RuntimeError("Interpolation failure.")
+
+# ========= 4) KOTWICA ON/TN =========
+def anchor_ON_TN_dfs(quotes: List[Tuple[str, float]]) -> Dict[ql.Date, float]:
+    """
+    Wyznacza DF do T+1 (koniec ON) i DF do T+2 (koniec TN = SPOT).
+    Jeśli brak TN w kwotowaniach — przyjmuje TN = ON.
+    Zwraca dict: {VAL_DATE:1, d1:P(T+1), d2:P(T+2)}
+    """
+    d0 = CAL.adjust(VAL_DATE, ql.Following)
+    d1 = CAL.advance(d0, 1, ql.Days, ql.Following)  # koniec ON
+    d2 = CAL.advance(d1, 1, ql.Days, ql.Following)  # koniec TN = SPOT
+
+    quotes_dict = dict(quotes)
+    S_ON = quotes_dict.get("ON")
+    if S_ON is None:
+        raise ValueError("Brakuje kwotowania 'ON' — wymagane do kotwiczenia.")
+    S_TN = quotes_dict.get("TN", S_ON)  # jeśli TN brak, użyj TN = ON
+
+    a_ON = DC_LEG.yearFraction(d0, d1)
+    a_TN = DC_LEG.yearFraction(d1, d2)
+
+    P_d1 = 1.0 / (1.0 + S_ON * a_ON)     # DF do T+1
+    P_d2 = P_d1 / (1.0 + S_TN * a_TN)    # DF do T+2 (spot)
+
+    return {VAL_DATE: 1.0, d1: P_d1, d2: P_d2}
+
+# ========= 5) BOOTSTRAP =========
+def bootstrap_ois(quotes: List[Tuple[str, float]]):
+    """
+    Zwraca:
+      dfs: dict[ql.Date] -> DF (obejmuje wszystkie płatności i końce)
+      instruments: lista info o harmonogramach (do kontroli)
+    """
+    dfs = anchor_ON_TN_dfs(quotes)  # kotwica ON/TN (P(T+1), P(T+2))
+    instruments_info = []
+
+    for tenor, S in quotes:
+        if tenor in ("ON", "TN"):
+            # ON/TN już wykorzystane do kotwicy — nic nie liczymy.
+            continue
+
+        start, end, coupons = build_ois_schedule(tenor)
+
+        # P(start) MUSI być znane (dla T+2 już jest z kotwicy)
+        if start not in dfs:
+            dfs[start] = loglinear_df_interpolate(start, dfs)
+
+        # suma znanych kuponów oprócz ostatniego
+        sum_known = 0.0
+        for d_pay, a in coupons[:-1]:
+            if d_pay not in dfs:
+                dfs[d_pay] = loglinear_df_interpolate(d_pay, dfs)
+            sum_known += a * dfs[d_pay]
+
+        # ostatni kupon
+        d_last, a_last = coupons[-1]
+        P_s = dfs[start]
+        P_T = (P_s - S * sum_known) / (1.0 + S * a_last)
+
+        dfs[d_last] = P_T
+
+        instruments_info.append({
+            "tenor": tenor, "S": S, "start": start, "end": end,
+            "coupons": coupons, "alpha_total": sum(a for _, a in coupons)
+        })
+
+    return dfs, instruments_info
+
+# ========= 6) URUCHOMIENIE I WYDRUK =========
+dfs, info = bootstrap_ois(QUOTES)
+
+nodes = sorted(dfs.keys(), key=lambda d: int(d.serialNumber()))
+
+print("== Kotwica ON/TN/Spot ==")
+for d in nodes[:3]:  # VAL_DATE, T+1, T+2
+    print(f"{d}  P={dfs[d]:.12f}")
+
+print("\n== Węzły (daty) i DF ==")
+for d in nodes:
+    P = dfs[d]
+    t = t_years(d)
+    zr_cont = 0.0 if t == 0.0 else -math.log(P) / t
+    print(f"{d}  t={t:>9.6f}  P(t)={P:.12f}  zero_cont={zr_cont:.12f}")
+
+print("\n== Market vs Model (par OIS) ==")
+for ins in info:
+    tenor, S = ins["tenor"], ins["S"]
+    start, end = ins["start"], ins["end"]
+    coupons = ins["coupons"]
+
+    P_s = dfs[start]
+    P_T = dfs[end]
+    denom = sum(a * dfs[d] for (d, a) in coupons)  # sum alpha_i * P(t_i)
+    S_model = (P_s - P_T) / denom
+    err_bp = (S_model - S) * 1e4
+    alpha_tot = sum(a for _, a in coupons)
+
+    print(f"{tenor:>3s}  start={start}  end={end}  alpha_sum={alpha_tot:.8f}  "
+          f"S_mkt={S:.8f}  S_mod={S_model:.8f}  err_bp={err_bp:+.3f}")
+
+
