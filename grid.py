@@ -823,3 +823,213 @@ for (tenor, alpha, t_s, T, sdate, edate) in instruments:
 
 print("\nKnots (years):", [f"{t:.8f}" for t in knot_times])
 print("Residual L2-norm:", float(np.linalg.norm(r_fin)))
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+USD OIS (SOFR) — Bootstrap krzywej dyskontowej
+Konwencje:
+  - Data wyceny: 27/10/2025
+  - Spot lag: 2 dni (T+2)
+  - Kalendarz: UnitedStates(FederalReserve)
+  - BDC: ≤1M -> Following, >1M -> Modified Following
+  - Day Count kuponu: ACT/360
+  - Freq stałej nogi: rocznie dla >1Y, pojedyncza płatność dla ≤1Y
+  - Interpolacja (gdy potrzebna): log-linear na DF po osi ACT/365F
+"""
+
+import math
+from typing import List, Tuple
+import QuantLib as ql
+
+# ========= 1) PARAMETRY RYNKOWE =========
+VAL_DATE = ql.Date(27, 10, 2025)
+ql.Settings.instance().evaluationDate = VAL_DATE
+
+CAL = ql.UnitedStates(ql.UnitedStates.FederalReserve)
+DC_LEG = ql.Actual360()          # α kuponów OIS (ACT/360)
+DC_AXIS = ql.Actual365Fixed()    # oś czasu do interpolacji (dowolna spójna)
+SPOT_LAG = 2                     # T+2 (jak u Ciebie)
+
+def bdc_for(tenor: str) -> ql.BusinessDayConvention:
+    t = tenor.upper()
+    return ql.Following if t in ("ON", "TN", "1W", "2W", "1M") else ql.ModifiedFollowing
+
+# PRZYKŁADOWE STAWKI (ułamek!). PODMIEŃ NA SWOJE.
+# Kolejność ma znaczenie (od najkrótszych do dłuższych).
+QUOTES: List[Tuple[str, float]] = [
+    ("ON", 0.05250),
+    ("1W", 0.05200),
+    ("1M", 0.05150),
+    ("3M", 0.05080),
+    ("6M", 0.05020),
+    ("1Y", 0.04950),
+    ("2Y", 0.04750),
+    ("3Y", 0.04600),
+]
+
+# ========= 2) POMOCNICZE: SPOT, HARMONOGRAM, ALFY =========
+def tenor_period(tenor: str) -> ql.Period:
+    t = tenor.upper().strip()
+    if t == "ON":         return ql.Period(1, ql.Days)
+    if t.endswith("W"):   return ql.Period(int(t[:-1]), ql.Weeks)
+    if t.endswith("M"):   return ql.Period(int(t[:-1]), ql.Months)
+    if t.endswith("Y"):   return ql.Period(int(t[:-1]), ql.Years)
+    raise ValueError(f"Nieznany tenor: {tenor}")
+
+def spot_date() -> ql.Date:
+    return CAL.advance(VAL_DATE, SPOT_LAG, ql.Days, ql.Following)
+
+def build_ois_schedule(tenor: str):
+    """
+    Zwraca:
+      start_date, end_date, coupons: List[(pay_date, alpha)]
+    Reguły:
+      - ON: start=dziś (Following), end=+1d (Following), 1 kupon
+      - ≤1Y: start=SPOT, end=SPOT+tenor (BDC wg zasad), 1 kupon
+      - >1Y: start=SPOT, end=SPOT+tenor (BDC=ModFoll), roczne kupony
+    """
+    t = tenor.upper().strip()
+
+    if t == "ON":
+        start = CAL.adjust(VAL_DATE, ql.Following)
+        end   = CAL.advance(start, 1, ql.Days, ql.Following)
+        alpha = DC_LEG.yearFraction(start, end)
+        return start, end, [(end, alpha)]
+
+    # forward-start
+    s = spot_date()
+    per = tenor_period(t)
+    bdc = bdc_for(t)
+    end = CAL.advance(s, per, bdc)
+
+    # ile kuponów?
+    # ≤1Y: pojedynczy
+    if per.length() == 1 and per.units() in (ql.Months, ql.Weeks):
+        alpha = DC_LEG.yearFraction(s, end)
+        return s, end, [(end, alpha)]
+    if per.units() == ql.Years and per.length() <= 1:
+        alpha = DC_LEG.yearFraction(s, end)
+        return s, end, [(end, alpha)]
+
+    # >1Y: roczne kupony stałej nogi
+    # budujemy schedule roczny od start do end; BDC: Modified Following, bez EOM
+    rule = ql.DateGeneration.Forward
+    sched = ql.Schedule(
+        s, end, ql.Period(ql.Annual), CAL, ql.ModifiedFollowing, ql.ModifiedFollowing,
+        rule, False
+    )
+    coupons = []
+    for i in range(1, len(sched)):
+        d_prev, d_pay = sched[i-1], sched[i]
+        alpha = DC_LEG.yearFraction(d_prev, d_pay)
+        coupons.append((d_pay, alpha))
+    return s, end, coupons
+
+# ========= 3) INTERPOLACJA LOG-LINEAR NA DF (po czasie ACT/365F) =========
+def t_years(d: ql.Date) -> float:
+    return DC_AXIS.yearFraction(VAL_DATE, d)
+
+def loglinear_df_interpolate(query_date: ql.Date, known_dfs: dict) -> float:
+    """
+    Interpolacja log-linear DF między najbliższymi znanymi datami (po ACT/365F).
+    known_dfs: dict[ql.Date] -> DF
+    """
+    if query_date in known_dfs:
+        return known_dfs[query_date]
+
+    # posortowane znane daty
+    dates = sorted(known_dfs.keys())
+    # skrajne przypadki
+    if query_date <= dates[0]:
+        return known_dfs[dates[0]]
+    if query_date >= dates[-1]:
+        return known_dfs[dates[-1]]
+
+    # znajdź sąsiadów
+    for i in range(1, len(dates)):
+        d0, d1 = dates[i-1], dates[i]
+        if d0 <= query_date <= d1:
+            t0, t1, tq = t_years(d0), t_years(d1), t_years(query_date)
+            lam = (tq - t0) / (t1 - t0)
+            lnP = (1.0 - lam) * math.log(known_dfs[d0]) + lam * math.log(known_dfs[d1])
+            return math.exp(lnP)
+    raise RuntimeError("Interpolation failure.")
+
+# ========= 4) BOOTSTRAP =========
+def bootstrap_ois(quotes: List[Tuple[str, float]]):
+    """
+    Zwraca:
+      dfs: dict[ql.Date] -> DF (obejmuje wszystkie płatności i końce)
+      instruments: list z informacjami o harmonogramach (do debug/wydruku)
+    """
+    dfs = {VAL_DATE: 1.0}  # P(0)=1
+    instruments_info = []
+
+    for tenor, S in quotes:
+        start, end, coupons = build_ois_schedule(tenor)
+        # zadbaj, by P(start) było znane (dla ON start=VAL_DATE)
+        if start not in dfs:
+            dfs[start] = loglinear_df_interpolate(start, dfs)
+
+        # suma znanych kuponów poza ostatnim
+        sum_known = 0.0
+        for d_pay, a in coupons[:-1]:
+            if d_pay not in dfs:
+                dfs[d_pay] = loglinear_df_interpolate(d_pay, dfs)
+            sum_known += a * dfs[d_pay]
+
+        # ostatni kupon:
+        d_last, a_last = coupons[-1]
+
+        # w zależności od liczby kuponów:
+        # - 1 kupon: P(T) = P(s) / (1 + S * alpha_last)
+        # - m>1 :    P(T) = (P(s) - S * sum_{i<m} alpha_i P(t_i)) / (1 + S * alpha_last)
+        P_s = dfs[start]  # DF na start
+
+        numerator = P_s - S * sum_known
+        denominator = 1.0 + S * a_last
+        P_T = numerator / denominator
+
+        dfs[d_last] = P_T
+
+        instruments_info.append({
+            "tenor": tenor, "S": S, "start": start, "end": end,
+            "coupons": coupons, "alpha_total": sum(a for _, a in coupons)
+        })
+
+    return dfs, instruments_info
+
+# ========= 5) URUCHOMIENIE I WYDRUK =========
+dfs, info = bootstrap_ois(QUOTES)
+
+# Posortowane węzły i wydruk DF/zero (continuous comp) z dużą precyzją
+nodes = sorted(dfs.keys(), key=lambda d: int(d.serialNumber()))
+
+print("== Węzły (daty) i DF ==")
+for d in nodes:
+    P = dfs[d]
+    t = t_years(d)
+    zr_cont = 0.0 if t == 0.0 else -math.log(P) / t
+    print(f"{d}  t={t:>9.6f}  P(t)={P:.12f}  zero_cont={zr_cont:.12f}")
+
+# Kontrola: par rate z krzywej = (P(start) - P(T)) / (sum alpha_i P(t_i))
+print("\n== Market vs Model (par OIS) ==")
+for ins in info:
+    tenor, S = ins["tenor"], ins["S"]
+    start, end = ins["start"], ins["end"]
+    coupons = ins["coupons"]
+
+    P_s = dfs[start]
+    P_T = dfs[end]
+    denom = sum(a * dfs[d] for (d, a) in coupons)  # sum alpha_i P(t_i)
+
+    S_model = (P_s - P_T) / denom
+    err_bp = (S_model - S) * 1e4
+    alpha_tot = sum(a for _, a in coupons)
+    print(f"{tenor:>3s}  start={start}  end={end}  alpha_sum={alpha_tot:.8f}  "
+          f"S_mkt={S:.8f}  S_mod={S_model:.8f}  err_bp={err_bp:+.3f}")
