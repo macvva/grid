@@ -1269,3 +1269,89 @@ for ins in info:
           f"S_mkt={S:.8f}  S_mod={S_model:.8f}  err_bp={err_bp:+.3f}")
 
 
+
+
+
+#tesssst
+
+import os
+import pandas as pd
+from pathlib import Path
+
+BASE_DIR = Path("Portfolio")   # główny folder z danymi
+MONTHS = {
+    "03": "AANA_2024_03.csv",
+    "04": "AANA_2024_04.csv",
+    "05": "AANA_2024_05.csv"
+}
+
+# Słownik: month → kontrahent → {waluta: suma}
+aggregated = {m: {} for m in MONTHS.keys()}
+
+for counterparty_folder in BASE_DIR.iterdir():
+    if counterparty_folder.is_dir():
+        counterparty = counterparty_folder.name
+        print(f"Przetwarzanie: {counterparty}")
+
+        # Zainicjalizuj strukturę dla kontrahenta
+        for m in MONTHS:
+            aggregated[m].setdefault(counterparty, {})
+
+        # Szukamy plików w folderze kontrahenta
+        for file in counterparty_folder.iterdir():
+            if file.is_file() and file.name.startswith("Portfolio_") and file.suffix.lower() in [".csv", ".txt", ".xls", ".xlsx"]:
+                
+                # Wyciągamy miesiąc z nazwy pliku
+                parts = file.name.split("_")
+                if len(parts) < 3:
+                    continue
+                
+                date_part = parts[-1].split(".")[0]   # yyyy_mm_dd
+                try:
+                    year, month, day = date_part.split("-") if "-" in date_part else date_part.split("_")
+                except:
+                    continue
+
+                if year != "2024" or month not in MONTHS:
+                    continue
+
+                # Wczytujemy plik
+                try:
+                    if file.suffix.lower() == ".csv":
+                        df = pd.read_csv(file)
+                    elif file.suffix.lower() in [".xls", ".xlsx"]:
+                        df = pd.read_excel(file)
+                    else:
+                        df = pd.read_csv(file, sep=";")
+                except Exception as e:
+                    print(f"Nie mogę wczytać pliku {file}: {e}")
+                    continue
+
+                # Sprawdzamy, czy wymagane kolumny są w pliku
+                if "Notional1" not in df.columns or "Ccy1" not in df.columns:
+                    print(f"Brak kolumn Notional1/Ccy1 w {file}")
+                    continue
+
+                # Agregujemy notional per waluta
+                tmp = df.groupby("Ccy1")["Notional1"].sum()
+
+                # Dodajemy do słownika sumowań
+                for ccy, notional in tmp.items():
+                    aggregated[month][counterparty][ccy] = aggregated[month][counterparty].get(ccy, 0) + notional
+
+
+# Zapis końcowych plików CSV
+for month, filename in MONTHS.items():
+    # Budujemy dataframe
+    rows = []
+    for counterparty, ccy_dict in aggregated[month].items():
+        row = {"Counterparty": counterparty}
+        row.update(ccy_dict)
+        rows.append(row)
+
+    df_out = pd.DataFrame(rows).fillna(0)
+    df_out.to_csv(filename, index=False)
+    print(f"Zapisano: {filename}")
+
+print("Gotowe!")
+
